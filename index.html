@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#07111f">
+<title>ESP32 Phone Face Check</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#07111f;color:#eef6ff;font:16px system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:18px;max-width:700px;margin-inline:auto}h1{font-size:1.55rem;margin:.3rem 0}.muted{color:#b6c6d8;font-size:.93rem;line-height:1.45}.panel{background:#101f32;border:1px solid #29405b;border-radius:16px;padding:15px;margin:14px 0}label{display:block;margin:10px 0 6px;font-weight:650}input,button{font:inherit;border-radius:10px;padding:12px;width:100%}input{border:1px solid #405873;background:#06101c;color:#fff}button{border:0;background:#38bdf8;color:#07111f;font-weight:750;margin-top:9px;cursor:pointer}button.secondary{background:#c4d2e2}button.danger{background:#fb7185}button:disabled{opacity:.5}.video-wrap{position:relative;background:#000;border-radius:14px;overflow:hidden;min-height:190px}video{width:100%;display:block;transform:scaleX(-1)}#status{font-size:1.1rem;font-weight:800;margin:0}#detail{min-height:2.6em;color:#d5e4f4}.good{color:#86efac!important}.bad{color:#fda4af!important}.warn{color:#fde68a!important}small{color:#b6c6d8;display:block;line-height:1.4}.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}@media(max-width:430px){.actions{grid-template-columns:1fr}}.pill{display:inline-block;border:1px solid #405873;border-radius:99px;padding:4px 9px;font-size:.8rem;color:#c9d9eb}code{overflow-wrap:anywhere}
+</style>
+<script defer src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/build/face-api.min.js"></script>
+</head>
+<body>
+<h1>Phone Camera Face Check</h1>
+<p class="muted">Enroll your face on this phone, then keep this page open while the ESP32 alarm is armed. Face processing happens in the browser; only the recognition status is sent to Blynk. This is a hobby prototype, not a secure access-control system.</p>
+<div class="panel">
+<label for="token">Blynk device Auth Token</label>
+<input id="token" type="password" autocomplete="off" placeholder="Paste this device's Auth Token here">
+<small>Do not share this page or token. Do not publish a copy containing a token. It is kept in memory only and is not saved by this page.</small>
+<label for="threshold">Recognition threshold: <span id="thresholdText">0.48</span></label>
+<input id="threshold" type="range" min="0.35" max="0.65" step="0.01" value="0.48">
+<small>Lower is stricter. Start at 0.48; adjust only if it repeatedly rejects you or accepts another person.</small>
+<button id="start">1. Start camera and load face models</button>
+</div>
+<div class="panel">
+<div class="video-wrap"><video id="video" playsinline muted></video></div>
+<p id="status" class="warn">Camera not started</p>
+<p id="detail">Start the camera, then enrol your face.</p>
+<div class="actions">
+<button id="enrol" disabled>2. Enrol my face</button>
+<button id="forget" class="secondary">Forget saved face</button>
+</div>
+<button id="stop" class="danger" disabled>Stop camera and mark unknown</button>
+</div>
+<div class="panel">
+<p><span class="pill">Blynk V1 = face recognised</span></p>
+<p><span class="pill">Blynk V2 = camera heartbeat</span></p>
+<p class="muted">ESP32 configuration needed: virtual pin V1 must update the authorised-face flag and V2 must update its heartbeat time. The ESP32 should trust recognition only while heartbeat is fresh (for example, under 6 seconds old). If camera, internet, or this page stops, it should treat the face as unknown.</p>
+<p class="muted">The app sends status to the Blynk Cloud over the internet. The ESP32 itself still needs a compatible 2.4 GHz Wi-Fi connection to Blynk. Your phone may use 5G mobile data separately.</p>
+</div>
+<script>
+(() => {
+  const MODEL_URL = 'https://justadudewhohacks.github.io/face-api.js/models';
+  const video = document.getElementById('video');
+  const statusEl = document.getElementById('status');
+  const detailEl = document.getElementById('detail');
+  const tokenInput = document.getElementById('token');
+  const startBtn = document.getElementById('start');
+  const enrolBtn = document.getElementById('enrol');
+  const stopBtn = document.getElementById('stop');
+  const forgetBtn = document.getElementById('forget');
+  const thresholdInput = document.getElementById('threshold');
+  const thresholdText = document.getElementById('thresholdText');
+  const STORAGE_KEY = 'esp32_face_descriptor_v1';
+  let stream = null, running = false, enrolled = null, timer = null;
+  let lastSentState = null, lastBeatAt = 0, heartbeatBit = 0, matchStreak = 0, lastFaceSeen = 0;
+  let lastSendAt = 0, busy = false, modelsLoaded = false;
+
+  function setStatus(text, kind, detail) {
+    statusEl.textContent = text;
+    statusEl.className = kind || '';
+    if (detail) detailEl.textContent = detail;
+  }
+  function loadSaved() {
+    try { const a = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
+      if (Array.isArray(a) && a.length === 128 && a.every(Number.isFinite)) enrolled = new Float32Array(a);
+    } catch (_) { enrolled = null; }
+  }
+  function distance(a,b) { let s=0; for(let i=0;i<a.length;i++){const d=a[i]-b[i];s+=d*d;} return Math.sqrt(s); }
+  async function sendPin(pin, val) {
+    const token = tokenInput.value.trim();
+    if (!token) throw new Error('Enter your Blynk Auth Token first.');
+    const url = `https://blynk.cloud/external/api/update?token=${encodeURIComponent(token)}&${pin}=${encodeURIComponent(val)}`;
+    // no-cors allows the simple GET even if the cloud API does not expose CORS headers.
+    // The response is opaque, so browser code cannot verify that Blynk accepted it.
+    await fetch(url, { method: 'GET', mode: 'no-cors', cache: 'no-store' });
+  }
+  async function setRecognised(value, force=false) {
+    if (lastSentState !== value || force) {
+      await sendPin('V1', value ? 1 : 0);
+      lastSentState = value;
+    }
+  }
+  async function heartbeat() {
+    if (!running || !tokenInput.value.trim()) return;
+    heartbeatBit = heartbeatBit ? 0 : 1;
+    try { await sendPin('V2', heartbeatBit); lastBeatAt = Date.now(); }
+    catch (e) { setStatus('Cannot send to Blynk', 'bad', e.message); }
+  }
+  async function loadFaceLibrary() {
+    const sources = [
+      'https://unpkg.com/face-api.js@0.22.2/build/face-api.min.js',
+      'https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/build/face-api.min.js'
+    ];
+    for (const src of sources) {
+      try {
+        await new Promise((resolve, reject) => {
+          const script = document.createElement('script');
+          script.src = src;
+          script.onload = () => window.faceapi ? resolve() : reject(new Error('Library global missing'));
+          script.onerror = () => reject(new Error('Could not load ' + src));
+          document.head.appendChild(script);
+        });
+        if (window.faceapi) return;
+      } catch (_) {}
+    }
+    throw new Error('Face library sources unavailable');
+  }
+
+  async function startCamera() {
+    if (!window.isSecureContext) {
+      setStatus('Secure page required', 'bad', 'Open this page through HTTPS or a trusted local preview so Chrome can grant camera access.'); return;
+    }
+    if (!window.faceapi) {
+      setStatus('Trying backup face library…', 'warn', 'The first CDN did not load. Trying an alternate source.');
+      try { await loadFaceLibrary(); } catch (e) {
+        setStatus('Face library could not load', 'bad', 'Both library sources failed. Check that your network allows cdn.jsdelivr.net and unpkg.com, then reopen this page using HTTPS.');
+        startBtn.disabled = false; return;
+      }
+    }
+    if (!tokenInput.value.trim()) { setStatus('Enter Blynk token first', 'warn', 'Use your device Auth Token. Do not share it or publish this page with the token in it.'); return; }
+    startBtn.disabled = true;
+    try {
+      setStatus('Loading face models…', 'warn', 'The model files download from the internet the first time.');
+      if (!modelsLoaded) {
+        await Promise.all([
+          faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+          faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+          faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL)
+        ]);
+        modelsLoaded = true;
+      }
+      stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:640},height:{ideal:480}},audio:false});
+      video.srcObject = stream;
+      await video.play();
+      running = true; enrolBtn.disabled = false; stopBtn.disabled = false;
+      setStatus(enrolled ? 'Camera ready — face enrolled' : 'Camera ready — enrol your face', 'good', 'Keep your face clearly visible in good light.');
+      await setRecognised(false, true);
+      await heartbeat();
+      timer = setInterval(tick, 900);
+      setInterval(() => { if (running) heartbeat(); }, 2000);
+    } catch (e) {
+      startBtn.disabled = false;
+      setStatus('Could not start camera', 'bad', `${e.name || 'Error'}: ${e.message || e}. Allow camera permission and use HTTPS.`);
+    }
+  }
+  async function getDescriptor() {
+    const result = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({inputSize:320,scoreThreshold:0.5})).withFaceLandmarks().withFaceDescriptor();
+    return result ? result.descriptor : null;
+  }
+  async function enrollFace() {
+    if (!running) return;
+    enrolBtn.disabled = true;
+    const samples=[];
+    setStatus('Enrolling face…', 'warn', 'Look at the camera and keep your face centred.');
+    try {
+      for (let i=0;i<7;i++) {
+        const d = await getDescriptor();
+        if (d) samples.push(Array.from(d));
+        await new Promise(r=>setTimeout(r,350));
+      }
+      if (samples.length < 4) throw new Error('Face not detected often enough. Improve lighting and try again.');
+      const mean = new Array(128).fill(0);
+      for (const s of samples) for(let j=0;j<128;j++) mean[j] += s[j]/samples.length;
+      enrolled = new Float32Array(mean);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(mean));
+      matchStreak = 0;
+      await setRecognised(false, true);
+      setStatus('Face enrolled on this phone', 'good', `Saved a face descriptor from ${samples.length} frames. Images are not saved by this page.`);
+    } catch(e) { setStatus('Enrolment failed', 'bad', e.message); }
+    finally { enrolBtn.disabled = false; }
+  }
+  async function tick() {
+    if (!running || busy) return;
+    busy = true;
+    try {
+      const d = await getDescriptor();
+      let match = false;
+      if (d) {
+        lastFaceSeen = Date.now();
+        if (enrolled) {
+          const dist = distance(d, enrolled);
+          match = dist < Number(thresholdInput.value);
+          matchStreak = match ? Math.min(matchStreak+1,10) : 0;
+          if (matchStreak >= 3) {
+            setStatus('YOU RECOGNISED', 'good', `Face distance ${dist.toFixed(3)}. Keep the page open for live monitoring.`);
+            await setRecognised(true);
+          } else {
+            setStatus('Face not verified yet', 'warn', `Face distance ${dist.toFixed(3)}. Need 3 consecutive matches.`);
+            await setRecognised(false);
+          }
+        } else {
+          setStatus('Unknown face — enrol first', 'warn', 'Tap “Enrol my face” while your face is centred.');
+          await setRecognised(false);
+        }
+      } else {
+        matchStreak=0;
+        setStatus('No face detected', '', 'Keep the camera open, facing the area to monitor, with good lighting.');
+        await setRecognised(false);
+      }
+      if (Date.now()-lastSendAt>800) lastSendAt=Date.now();
+    } catch(e) {
+      setStatus('Recognition error', 'bad', e.message || String(e));
+      try { await setRecognised(false); } catch(_) {}
+    } finally { busy=false; }
+  }
+  function stopCamera() {
+    running=false;
+    if (timer) clearInterval(timer);
+    timer=null;
+    if (stream) for (const t of stream.getTracks()) t.stop();
+    stream=null; video.srcObject=null;
+    enrolBtn.disabled=true; stopBtn.disabled=true; startBtn.disabled=false;
+    setRecognised(false, true).catch(()=>{});
+    setStatus('Camera stopped', 'warn', 'ESP32 should now treat the face as unknown.');
+  }
+  startBtn.addEventListener('click', startCamera);
+  enrolBtn.addEventListener('click', enrollFace);
+  stopBtn.addEventListener('click', stopCamera);
+  forgetBtn.addEventListener('click', ()=>{ localStorage.removeItem(STORAGE_KEY); enrolled=null; matchStreak=0; setRecognised(false,true).catch(()=>{}); setStatus('Saved face forgotten', 'warn', 'Enroll again when ready.'); });
+  thresholdInput.addEventListener('input', ()=> thresholdText.textContent=Number(thresholdInput.value).toFixed(2));
+  document.addEventListener('visibilitychange', ()=>{ if (document.hidden && running) { setRecognised(false,true).catch(()=>{}); } });
+  window.addEventListener('pagehide', ()=>{ running=false; if(stream) for(const t of stream.getTracks()) t.stop(); });
+  loadSaved();
+  if (enrolled) setStatus('Saved face found', 'warn', 'Start the camera to compare your live face.');
+})();
+</script>
+</body>
+</html>
